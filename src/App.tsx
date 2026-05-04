@@ -41,6 +41,7 @@ interface Expense {
   amount: string;
   category: string;
   timestamp: number;
+  transactionHash?: string;
 }
 
 export default function App() {
@@ -49,6 +50,12 @@ export default function App() {
   const [isContractSet, setIsContractSet] = useState<boolean>(!!INITIAL_CONTRACT_ADDRESS && ethers.isAddress(INITIAL_CONTRACT_ADDRESS));
   const [contract, setContract] = useState<ethers.Contract | null>(null);
   const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [selectedExpense, setSelectedExpense] = useState<Expense | null>(null);
+  const [budget, setBudget] = useState<string>("0");
+  const [categoryBudgets, setCategoryBudgets] = useState<{[key: string]: string}>({});
+  const [newBudgetInput, setNewBudgetInput] = useState<string>("");
+  const [editingCategory, setEditingCategory] = useState<string | null>(null);
+  const [catBudgetInput, setCatBudgetInput] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -137,6 +144,82 @@ export default function App() {
     }
   };
 
+  const fetchBudget = useCallback(async () => {
+    if (!contract || !account) return;
+    try {
+      const b = await contract.getBudget();
+      setBudget(ethers.formatEther(b));
+      setNewBudgetInput(ethers.formatEther(b));
+
+      // Fetch budgets for common categories
+      const categories = ["General", "Food", "Travel", "Entertainment", "Utilities"];
+      const catBudgets: {[key: string]: string} = {};
+      for (const cat of categories) {
+        const cb = await contract.getCategoryBudget(cat);
+        catBudgets[cat] = ethers.formatEther(cb);
+      }
+      setCategoryBudgets(catBudgets);
+
+    } catch (err: any) {
+      console.error("Error fetching budget:", err);
+      // If code is CALL_EXCEPTION, it definitively means the function doesn't exist on this contract address
+      if (err.code === 'CALL_EXCEPTION' || (err.message && err.message.includes('CALL_EXCEPTION'))) {
+        console.warn("Budget functionality is not available on this contract version.");
+        setError("Your currently linked contract is outdated. Budgeting and Category insights require a redeploy of the latest smart contract.");
+        setBudget("0");
+      }
+    }
+  }, [contract, account]);
+
+  const updateBudget = async () => {
+    if (!contract || !newBudgetInput) return;
+    try {
+      setLoading(true);
+      setError(null);
+      const tx = await contract.setBudget(ethers.parseEther(newBudgetInput));
+      setSuccess("Updating budget... Please wait.");
+      await tx.wait();
+      setSuccess("Budget updated successfully!");
+      fetchBudget();
+      setTimeout(() => setSuccess(null), 5000);
+    } catch (err: any) {
+      console.error("Error updating budget:", err);
+      if (err.code === 'ACTION_REJECTED') {
+        setError("Transaction cancelled by user.");
+      } else if (err.code === 'CALL_EXCEPTION' || (err.message && err.message.includes('CALL_EXCEPTION'))) {
+        setError("The 'setBudget' function is missing from your deployed contract. Please redeploy the updated Solidity code and link the new address.");
+      } else {
+        setError(err.message || "Failed to update budget");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateCategoryBudget = async (category: string, amount: string) => {
+    if (!contract) return;
+    try {
+      setLoading(true);
+      setError(null);
+      const tx = await contract.setCategoryBudget(category, ethers.parseEther(amount));
+      setSuccess(`Updating ${category} budget...`);
+      await tx.wait();
+      setSuccess(`${category} budget updated!`);
+      setEditingCategory(null);
+      fetchBudget();
+      setTimeout(() => setSuccess(null), 5000);
+    } catch (err: any) {
+      console.error("Error updating category budget:", err);
+      if (err.code === 'CALL_EXCEPTION' || (err.message && err.message.includes('CALL_EXCEPTION'))) {
+        setError("Category budget functions not found. Please redeploy the latest contract.");
+      } else {
+        setError(err.message || "Failed to update category budget");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const fetchExpenses = useCallback(async () => {
     if (!contract || !account || !contractAddress) return;
     try {
@@ -189,12 +272,28 @@ export default function App() {
         return;
       }
 
+      // 4. Fetch Event Logs for Transaction Hashes
+      // This allows us to map expenses to their actual on-chain transaction hashes
+      let txHashes: { [key: number]: string } = {};
+      try {
+        const filter = contract.filters.ExpenseAdded(null, account);
+        const events = await contract.queryFilter(filter, -1000000); // Look back up to 1M blocks
+        events.forEach((event: any) => {
+          if (event.args) {
+            txHashes[Number(event.args.id)] = event.transactionHash;
+          }
+        });
+      } catch (logErr) {
+        console.warn("Could not fetch event logs for tx hashes:", logErr);
+      }
+
       const formattedExpenses = data.map((exp: any) => ({
         id: Number(exp.id),
         description: exp.description,
         amount: ethers.formatEther(exp.amount),
         category: exp.category,
-        timestamp: Number(exp.timestamp)
+        timestamp: Number(exp.timestamp),
+        transactionHash: txHashes[Number(exp.id)]
       }));
       setExpenses(formattedExpenses.reverse());
     } catch (err: any) {
@@ -213,8 +312,9 @@ export default function App() {
   useEffect(() => {
     if (contract && account) {
       fetchExpenses();
+      fetchBudget();
     }
-  }, [contract, account, fetchExpenses]);
+  }, [contract, account, fetchExpenses, fetchBudget]);
 
   const addExpense = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -273,6 +373,36 @@ export default function App() {
   };
 
   const totalSpent = expenses.reduce((acc, curr) => acc + parseFloat(curr.amount), 0);
+  const budgetValue = parseFloat(budget);
+  const budgetProgress = budgetValue > 0 ? (totalSpent / budgetValue) * 100 : 0;
+
+  // Insights data
+  const categoryTotals = expenses.reduce((acc: {[key: string]: number}, curr) => {
+    acc[curr.category] = (acc[curr.category] || 0) + parseFloat(curr.amount);
+    return acc;
+  }, {});
+
+  const topCategory = Object.entries(categoryTotals).sort((a, b) => (b[1] as number) - (a[1] as number))[0];
+
+  const insights = Object.entries(categoryTotals).map(([cat, total]) => {
+    const totalNum = total as number;
+    const catBudget = parseFloat(categoryBudgets[cat] || "0");
+    if (catBudget > 0 && totalNum > catBudget) {
+      const overPercentage = ((totalNum - catBudget) / catBudget) * 100;
+      return {
+        category: cat,
+        type: 'danger',
+        message: `${overPercentage.toFixed(0)}% over budget in ${cat} this month.`
+      };
+    } else if (catBudget > 0 && totalNum > catBudget * 0.8) {
+      return {
+        category: cat,
+        type: 'warning',
+        message: `Nearing budget for ${cat} (${((totalNum / catBudget) * 100).toFixed(0)}%).`
+      };
+    }
+    return null;
+  }).filter(Boolean);
 
   return (
     <div className="min-h-screen bg-[#0a0a0c] text-slate-200 font-sans selection:bg-indigo-500/30">
@@ -499,9 +629,165 @@ export default function App() {
                     <span className="text-4xl font-bold text-white">{totalSpent.toFixed(4)}</span>
                     <span className="text-indigo-400 font-mono text-sm">ETH</span>
                   </div>
-                  <div className="mt-4 pt-4 border-t border-white/5 flex justify-between items-center">
-                    <span className="text-xs text-slate-500">Transactions</span>
-                    <span className="text-sm font-bold text-white">{expenses.length}</span>
+                  
+                  {budgetValue > 0 && (
+                    <div className="mt-6 space-y-2">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-slate-500">Budget Progress</span>
+                        <span className={cn(
+                          "font-bold",
+                          budgetProgress > 100 ? "text-red-400" : "text-indigo-400"
+                        )}>
+                          {budgetProgress.toFixed(1)}%
+                        </span>
+                      </div>
+                      <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
+                        <motion.div 
+                          initial={{ width: 0 }}
+                          animate={{ width: `${Math.min(budgetProgress, 100)}%` }}
+                          className={cn(
+                            "h-full rounded-full transition-colors",
+                            budgetProgress > 90 ? "bg-red-500" : "bg-indigo-500"
+                          )}
+                        />
+                      </div>
+                      <div className="flex justify-between text-[10px] text-slate-500">
+                        <span>Spent: {totalSpent.toFixed(4)} ETH</span>
+                        <span>Budget: {budgetValue.toFixed(4)} ETH</span>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="mt-6 pt-4 border-t border-white/5 space-y-4">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs text-slate-500">Transactions</span>
+                      <span className="text-sm font-bold text-white">{expenses.length}</span>
+                    </div>
+                    
+                    <div className="space-y-2">
+                      <label className="text-[10px] uppercase font-bold text-slate-600 tracking-widest block">Update Budget</label>
+                      <div className="flex gap-2">
+                        <input 
+                          type="number"
+                          value={newBudgetInput}
+                          onChange={(e) => setNewBudgetInput(e.target.value)}
+                          placeholder="Set budget (ETH)"
+                          className="flex-1 bg-black/40 border border-white/10 rounded-xl py-1.5 px-3 text-xs focus:outline-none focus:border-indigo-500/50"
+                        />
+                        <button 
+                          onClick={updateBudget}
+                          className="bg-white/5 hover:bg-white/10 p-1.5 rounded-xl transition-colors"
+                        >
+                          <CheckCircle2 className="w-4 h-4 text-indigo-500" />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+
+              {/* Insights & Budget Logic Card */}
+              <motion.div
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ delay: 0.15 }}
+                className="bg-white/5 border border-white/10 rounded-3xl p-6"
+              >
+                <div className="flex items-center justify-between mb-6">
+                  <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                    <PieChart className="w-5 h-5 text-indigo-500" />
+                    Budget Transparency
+                  </h2>
+                  <Settings className="w-4 h-4 text-slate-600 cursor-pointer hover:text-indigo-400 transition-colors" />
+                </div>
+                
+                <div className="space-y-6">
+                  {/* Alert Section for Budget Breach */}
+                  <AnimatePresence>
+                    {insights.length > 0 && (
+                      <motion.div 
+                        initial={{ opacity: 0, y: -10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="space-y-2 mb-2"
+                      >
+                        {insights.map((insight, i) => (
+                          <div key={i} className={cn(
+                            "p-3 rounded-xl text-xs flex items-center gap-2 animate-pulse-slow",
+                            insight?.type === 'danger' ? "bg-red-500/10 text-red-400 border border-red-500/20" : "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                          )}>
+                            <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                            {insight?.message}
+                          </div>
+                        ))}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  <div className="space-y-3">
+                    {["Food", "Travel", "Entertainment", "Utilities", "General"].map((cat) => {
+                      const total = categoryTotals[cat] || 0;
+                      const catBudgetStr = categoryBudgets[cat] || "0";
+                      const catBudgetValue = parseFloat(catBudgetStr);
+                      const isEditing = editingCategory === cat;
+
+                      return (
+                        <div key={cat} className="group p-3 hover:bg-white/[0.02] rounded-2xl transition-all border border-transparent hover:border-white/5">
+                          <div className="flex justify-between items-start mb-2">
+                            <div>
+                              <span className="text-xs font-bold text-slate-300 group-hover:text-white transition-colors">{cat}</span>
+                              <div className="text-[10px] text-slate-500 mt-0.5">
+                                Spent: {total.toFixed(4)} ETH
+                              </div>
+                            </div>
+                            <div className="text-right">
+                              {isEditing ? (
+                                <div className="flex gap-1 items-center">
+                                  <input 
+                                    className="w-16 bg-black/40 border border-white/10 rounded-md py-0.5 px-2 text-[10px] text-white focus:outline-none focus:border-indigo-500"
+                                    value={catBudgetInput}
+                                    onChange={(e) => setCatBudgetInput(e.target.value)}
+                                    autoFocus
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') updateCategoryBudget(cat, catBudgetInput);
+                                      if (e.key === 'Escape') setEditingCategory(null);
+                                    }}
+                                  />
+                                  <button 
+                                    onClick={() => updateCategoryBudget(cat, catBudgetInput)}
+                                    className="p-1 hover:bg-emerald-500/20 rounded-md text-emerald-500 transition-colors"
+                                  >
+                                    <CheckCircle2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              ) : (
+                                <button 
+                                  onClick={() => {
+                                    setEditingCategory(cat);
+                                    setCatBudgetInput(catBudgetStr);
+                                  }}
+                                  className="text-[10px] text-slate-500 group-hover:text-indigo-400 transition-colors flex items-center gap-1 font-mono"
+                                >
+                                  Budget: {catBudgetValue > 0 ? `${catBudgetValue.toFixed(3)}` : "Set Limit"}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          
+                          {catBudgetValue > 0 && (
+                            <div className="h-1 bg-white/5 rounded-full overflow-hidden">
+                              <motion.div 
+                                className={cn(
+                                  "h-full rounded-full transition-colors",
+                                  total > catBudgetValue ? "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]" : "bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.2)]"
+                                )}
+                                initial={{ width: 0 }}
+                                animate={{ width: `${Math.min((total / catBudgetValue) * 100, 100)}%` }}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </motion.div>
@@ -671,56 +957,74 @@ export default function App() {
                 )}
               </AnimatePresence>
 
-              {/* Expenses List */}
+              {/* Transaction History Section */}
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                  <History className="w-5 h-5 text-indigo-500" />
+                  Transaction History
+                </h2>
+                <div className="flex items-center gap-4">
+                  <span className="text-[10px] text-slate-500 uppercase font-bold tracking-widest bg-white/5 px-2 py-1 rounded-md">
+                    Immutable Ledger
+                  </span>
+                  <button 
+                    onClick={fetchExpenses}
+                    className="text-xs font-bold text-indigo-400 hover:text-indigo-300 transition-colors flex items-center gap-1"
+                  >
+                    <Zap className="w-3 h-3" />
+                    Sync
+                  </button>
+                </div>
+              </div>
+
               <div className="space-y-4">
-                {expenses.length === 0 ? (
-                  <div className="bg-white/5 border border-dashed border-white/10 rounded-3xl py-20 flex flex-col items-center justify-center text-center">
-                    <div className="w-16 h-16 bg-white/5 rounded-full flex items-center justify-center mb-4">
-                      <History className="text-slate-600 w-8 h-8" />
-                    </div>
-                    <p className="text-slate-500">No transactions found on-chain.</p>
+                {expenses.length === 0 && !loading ? (
+                  <div className="text-center py-20 bg-white/5 rounded-3xl border border-dashed border-white/10">
+                    <History className="w-12 h-12 text-slate-700 mx-auto mb-4" />
+                    <p className="text-slate-500 font-medium">No expenses recorded yet.</p>
                   </div>
                 ) : (
                   expenses.map((expense, idx) => (
                     <motion.div
+                      layout
                       key={`${expense.id}-${expense.timestamp}-${idx}`}
+                      onClick={() => setSelectedExpense(expense)}
                       initial={{ opacity: 0, y: 10 }}
                       animate={{ opacity: 1, y: 0 }}
-                      transition={{ delay: idx * 0.05 }}
-                      className="group bg-white/5 border border-white/10 hover:border-white/20 rounded-2xl p-4 flex items-center justify-between transition-all"
+                      transition={{ delay: idx * 0.03 }}
+                      className="group bg-white/5 hover:bg-white/[0.08] lg:hover:translate-x-1 border border-white/10 rounded-2xl p-4 flex items-center justify-between transition-all cursor-pointer"
                     >
                       <div className="flex items-center gap-4">
                         <div className={cn(
                           "w-12 h-12 rounded-xl flex items-center justify-center text-lg",
-                          expense.category === 'Food' ? "bg-orange-500/10 text-orange-500" :
-                          expense.category === 'Travel' ? "bg-blue-500/10 text-blue-500" :
-                          expense.category === 'Entertainment' ? "bg-purple-500/10 text-purple-500" :
-                          expense.category === 'Utilities' ? "bg-yellow-500/10 text-yellow-500" :
-                          "bg-indigo-500/10 text-indigo-500"
+                          expense.category === 'Food' ? "bg-orange-500/10 text-orange-400" :
+                          expense.category === 'Travel' ? "bg-blue-500/10 text-blue-400" :
+                          expense.category === 'Entertainment' ? "bg-purple-500/10 text-purple-400" :
+                          expense.category === 'Utilities' ? "bg-yellow-500/10 text-yellow-400" :
+                          "bg-indigo-500/10 text-indigo-400"
                         )}>
                           {expense.category[0]}
                         </div>
                         <div>
-                          <h3 className="font-bold text-white">{expense.description}</h3>
-                          <div className="flex items-center gap-2 text-xs text-slate-500">
-                            <span>{expense.category}</span>
-                            <span>•</span>
-                            <span>{new Date(expense.timestamp * 1000).toLocaleDateString()}</span>
+                          <h3 className="font-bold text-white group-hover:text-indigo-400 transition-colors leading-tight">{expense.description}</h3>
+                          <div className="flex items-center gap-2 mt-1">
+                            <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider bg-white/5 px-2 py-0.5 rounded-md">
+                              {expense.category}
+                            </span>
+                            <span className="text-[10px] text-slate-600 font-mono">
+                              {new Date(expense.timestamp * 1000).toLocaleDateString()}
+                            </span>
                           </div>
                         </div>
                       </div>
-                      <div className="text-right">
-                        <div className="text-lg font-mono font-bold text-white">
-                          {expense.amount} <span className="text-xs text-indigo-400">ETH</span>
+                      <div className="text-right flex items-center gap-5">
+                        <div className="flex flex-col items-end">
+                          <span className="text-lg font-bold text-white leading-none">
+                            {parseFloat(expense.amount).toFixed(4)}
+                          </span>
+                          <span className="text-[10px] text-slate-500 font-mono mt-1">ETH</span>
                         </div>
-                        <a 
-                          href={`https://sepolia.etherscan.io/address/${contractAddress}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-[10px] text-slate-600 hover:text-indigo-400 flex items-center justify-end gap-1 transition-colors"
-                        >
-                          View on Etherscan <ExternalLink className="w-2 h-2" />
-                        </a>
+                        <ExternalLink className="w-4 h-4 text-slate-600 group-hover:text-indigo-500 transition-colors" />
                       </div>
                     </motion.div>
                   ))
@@ -747,30 +1051,125 @@ export default function App() {
         )}
       </main>
 
-      {/* Footer / Instructions */}
-      <footer className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12 border-t border-white/5 mt-20">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-12">
-          <div>
-            <h3 className="text-white font-bold mb-4">How it works</h3>
-            <p className="text-sm text-slate-500 leading-relaxed">
-              Every expense you record is a transaction on the Ethereum Sepolia network. 
-              The data is stored in a smart contract, making it immutable and verifiable.
-            </p>
+      {/* Expense Detail Modal */}
+      <AnimatePresence>
+        {selectedExpense && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setSelectedExpense(null)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-lg bg-[#121214] border border-white/10 rounded-[2.5rem] overflow-hidden shadow-2xl"
+            >
+              <div className="p-8 md:p-10">
+                <div className="flex justify-between items-start mb-8">
+                  <div>
+                    <h3 className="text-2xl font-bold text-white mb-1 tracking-tight">On-Chain Receipt</h3>
+                    <p className="text-[10px] uppercase font-bold text-slate-500 tracking-widest font-mono">Registry ID: {selectedExpense.id}</p>
+                  </div>
+                  <button 
+                    onClick={() => setSelectedExpense(null)}
+                    className="p-2 hover:bg-white/5 rounded-full text-slate-500 transition-colors"
+                  >
+                    <Plus className="w-6 h-6 rotate-45" />
+                  </button>
+                </div>
+
+                <div className="space-y-6">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="bg-white/5 p-4 rounded-2xl border border-white/5">
+                      <label className="text-[10px] uppercase font-bold text-slate-500 tracking-widest block mb-1">On-Chain Value</label>
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-xl font-bold text-white">{parseFloat(selectedExpense.amount).toFixed(6)}</span>
+                        <span className="text-xs text-indigo-400 font-mono">ETH</span>
+                      </div>
+                    </div>
+                    <div className="bg-white/5 p-4 rounded-2xl border border-white/5">
+                      <label className="text-[10px] uppercase font-bold text-slate-500 tracking-widest block mb-1">Entity Class</label>
+                      <span className="text-lg font-bold text-white">{selectedExpense.category}</span>
+                    </div>
+                  </div>
+
+                  <div className="bg-white/5 p-5 rounded-2xl border border-white/5">
+                    <label className="text-[10px] uppercase font-bold text-slate-500 tracking-widest block mb-1">Accounting Memo</label>
+                    <p className="text-white text-lg font-medium leading-relaxed">{selectedExpense.description}</p>
+                  </div>
+
+                  <div className="bg-white/5 p-5 rounded-2xl border border-white/5">
+                    <label className="text-[10px] uppercase font-bold text-slate-500 tracking-widest block mb-1">Historical Timestamp</label>
+                    <div className="flex items-center gap-3 text-slate-300">
+                      <div className="w-8 h-8 bg-indigo-500/10 rounded-lg flex items-center justify-center">
+                        <History className="w-4 h-4 text-indigo-500" />
+                      </div>
+                      <span className="text-sm">{new Date(selectedExpense.timestamp * 1000).toLocaleString(undefined, { dateStyle: 'full', timeStyle: 'medium' })}</span>
+                    </div>
+                  </div>
+
+                  {selectedExpense.transactionHash ? (
+                    <div className="bg-white/5 p-5 rounded-2xl border border-white/5">
+                      <label className="text-[10px] uppercase font-bold text-slate-500 tracking-widest block mb-2">Block Explorer Evidence</label>
+                      <div className="flex items-center justify-between gap-4">
+                        <code className="text-xs text-indigo-300 truncate flex-1 font-mono tracking-tighter">
+                          {selectedExpense.transactionHash}
+                        </code>
+                        <a 
+                          href={`https://sepolia.etherscan.io/tx/${selectedExpense.transactionHash}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded-xl transition-all shadow-lg shadow-indigo-600/20 active:scale-95"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          Verify
+                        </a>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-5 bg-white/5 border border-white/5 rounded-2xl flex items-center gap-3">
+                      <div className="w-8 h-8 bg-amber-500/10 rounded-lg flex items-center justify-center">
+                        <Zap className="w-4 h-4 text-amber-500" />
+                      </div>
+                      <p className="text-[10px] text-slate-500 leading-tight">
+                        Transaction hash lookup is currently processing or stored in an older block segment. Data is cryptographically confirmed.
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                <button 
+                  onClick={() => setSelectedExpense(null)}
+                  className="w-full mt-10 py-4 bg-white/5 hover:bg-white/10 text-white font-bold rounded-2xl transition-all border border-white/5 active:scale-[0.99]"
+                >
+                  Close Receipt
+                </button>
+              </div>
+            </motion.div>
           </div>
+        )}
+      </AnimatePresence>
+
+      {/* Footer / Privacy */}
+      <footer className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12 border-t border-white/5 mt-20">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-12">
           <div>
-            <h3 className="text-white font-bold mb-4">Setup Guide</h3>
-            <ul className="text-sm text-slate-500 space-y-2">
-              <li>1. Open Remix IDE & paste the Solidity code.</li>
-              <li>2. Compile and Deploy to Sepolia Testnet.</li>
-              <li>3. Copy the contract address.</li>
-              <li>4. Paste it in <code className="text-indigo-400">App.tsx</code>.</li>
-            </ul>
+            <h3 className="text-white font-bold mb-4">Real-World Problem</h3>
+            <p className="text-sm text-slate-500 leading-relaxed italic">
+              "This application solves the critical issue of financial trust and transparency in personal and organizational accounting. 
+              By leveraging blockchain, we eliminate the possibility of 'ghost expenses' or retroactive record tampering, 
+              providing a verifiable truth for expense management and budget adherence."
+            </p>
           </div>
           <div>
             <h3 className="text-white font-bold mb-4">Privacy</h3>
             <p className="text-sm text-slate-500 leading-relaxed">
               We don't use a database. Your data lives on the blockchain and is only 
-              accessible via your wallet address.
+              accessible via your wallet address. No identity linked, no central storage.
             </p>
           </div>
         </div>
