@@ -1,0 +1,5 @@
+{
+  "name": "EtherSpend - Decentralized Expense Tracker",
+  "description": "A blockchain-based expense tracker using Ethereum Sepolia, Solidity, and MetaMask for secure, transparent financial logging.",
+  "requestFramePermissions": []
+}
